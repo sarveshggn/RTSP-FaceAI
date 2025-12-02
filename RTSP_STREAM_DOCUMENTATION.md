@@ -33,46 +33,46 @@ The RTSP stream processing implementation transforms the face recognition pipeli
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    RTSP Camera Stream                           │
-│              (rtsp://192.168.10.94/live1.sdp)                  │
+│              (rtsp://192.168.10.94/live1.sdp)                   │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    CAPTURE THREAD                                │
+│                    CAPTURE THREAD                               │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │ 1. Connect to RTSP stream                                │   │
 │  │ 2. Read frames continuously                              │   │
-│  │ 3. Handle reconnection on failures                      │   │
+│  │ 3. Handle reconnection on failures                       │   │
 │  │ 4. Push frames to queue (drop old if full)               │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    FRAME QUEUE                                   │
-│              (maxsize=2, FIFO with drop)                         │
-│  • Keeps only latest 2 frames                                    │
+│                    FRAME QUEUE                                  │
+│              (maxsize=2, FIFO with drop)                        │
+│  • Keeps only latest 2 frames                                   │
 │  • Drops oldest frame when full                                 │
 │  • Prevents memory buildup                                      │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    MAIN PROCESSING THREAD                        │
+│                    MAIN PROCESSING THREAD                       │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │ 1. Get frame from queue                                   │   │
-│  │ 2. Face Detection (SCRFD)                                 │   │
+│  │ 1. Get frame from queue                                  │   │
+│  │ 2. Face Detection (SCRFD)                                │   │
 │  │ 3. Face Recognition (AdaFace)                            │   │
-│  │ 4. FAISS Similarity Search                                │   │
+│  │ 4. FAISS Similarity Search                               │   │
 │  │ 5. Draw overlays (bounding boxes, labels, ref images)    │   │
-│  │ 6. Display frame                                          │   │
+│  │ 6. Display frame                                         │   │
 │  │ 7. Optional: Write to video file                         │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └────────────────────────┬────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    OUTPUT                                        │
+│                    OUTPUT                                       │
 │  • Live Display Window (OpenCV)                                 │
 │  • Optional: Recorded Video File                                │
 │  • Statistics & Performance Metrics                             │
@@ -795,7 +795,6 @@ index.nprobe = 200  # More thorough search
 - Total frames processed
 - Faces detected
 - Matched faces
-- Dropped frames
 - Reconnection status
 
 ---
@@ -824,6 +823,6 @@ The system maintains real-time performance while providing robust error handling
 ---
 
 **Document Version**: 1.0  
-**Last Updated**: 2024  
-**Author**: Face Recognition Pipeline Team
+**Last Updated**: 2025  
+**Author**: Sarvesh Joshi
 
