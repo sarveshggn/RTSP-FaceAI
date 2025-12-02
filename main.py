@@ -9,8 +9,10 @@ import shutil
 import tempfile
 import faiss
 import sqlite3
+import threading
+import queue
 from collections import deque
-from typing import Set, List, Dict
+from typing import Set, List, Dict, Optional, Tuple
 
 from fr.adaface_openvino import AdaFaceOpenVINO
 from fd.scrfd_openvino_sd_blur_detect import SCRFD
@@ -50,6 +52,14 @@ DEFAULT_PHOTOS_FOLDER = "/home/sr/Photos"
 DEFAULT_JSONL_PATH = 'final_embeddings_adaface_ov_fp16.jsonl'
 DEFAULT_DB_PATH = 'embeddings.db'
 DEFAULT_EMBEDDINGS_DIR = 'embeddings_storage'
+
+# RTSP stream constants
+RTSP_BUFFER_SIZE = 1  # Reduce latency by minimizing buffer
+RTSP_RETRY_COUNT = 5  # Number of reconnection attempts
+RTSP_RETRY_DELAY = 2  # Seconds between reconnection attempts
+RTSP_TIMEOUT = 5  # Timeout for frame read operations (seconds)
+FRAME_QUEUE_MAXSIZE = 2  # Maximum frames in queue (keep only latest)
+ENABLE_RECORDING_DEFAULT = False  # Default recording state
 
 # ============================================================================
 # Model Initialization
@@ -1024,13 +1034,404 @@ def compare_video_live_display(video_path: str, threshold: float = DEFAULT_VIDEO
 
 
 # ============================================================================
+# RTSP Stream Processing Functions
+# ============================================================================
+
+def connect_rtsp_stream(rtsp_url: str, retry_count: int = RTSP_RETRY_COUNT, 
+                        retry_delay: int = RTSP_RETRY_DELAY) -> cv2.VideoCapture:
+    """
+    Connect to RTSP stream with retry logic.
+    
+    Args:
+        rtsp_url: RTSP stream URL (e.g., 'rtsp://username:password@ip:port/stream')
+        retry_count: Number of reconnection attempts
+        retry_delay: Seconds between retry attempts
+    
+    Returns:
+        cv2.VideoCapture object
+    
+    Raises:
+        RuntimeError: If connection fails after all retries
+    """
+    for attempt in range(retry_count):
+        print(f"Attempting to connect to RTSP stream (attempt {attempt + 1}/{retry_count})...")
+        cap = cv2.VideoCapture(rtsp_url)
+        
+        # Configure for low latency
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, RTSP_BUFFER_SIZE)
+        
+        # Test connection by reading a frame
+        ret, frame = cap.read()
+        if cap.isOpened() and ret and frame is not None:
+            print(f"Successfully connected to RTSP stream")
+            return cap
+        
+        cap.release()
+        if attempt < retry_count - 1:
+            print(f"Connection failed. Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    
+    raise RuntimeError(f"Failed to connect to RTSP stream after {retry_count} attempts")
+
+
+def rtsp_capture_thread(rtsp_url: str, frame_queue: queue.Queue, 
+                        stop_event: threading.Event, reconnect_event: threading.Event,
+                        stats: Dict) -> None:
+    """
+    Thread function to capture frames from RTSP stream.
+    
+    Args:
+        rtsp_url: RTSP stream URL
+        frame_queue: Queue to put captured frames
+        stop_event: Event to signal thread to stop
+        reconnect_event: Event to signal reconnection needed
+        stats: Dictionary to store statistics (frames_captured, frames_dropped, reconnect_count)
+    """
+    cap = None
+    reconnect_count = 0
+    
+    while not stop_event.is_set():
+        try:
+            # Connect or reconnect
+            if cap is None or reconnect_event.is_set():
+                if cap is not None:
+                    cap.release()
+                try:
+                    cap = connect_rtsp_stream(rtsp_url)
+                    reconnect_count += 1
+                    stats['reconnect_count'] = reconnect_count
+                    reconnect_event.clear()
+                    print(f"[Capture Thread] Reconnected (total reconnects: {reconnect_count})")
+                except RuntimeError as e:
+                    print(f"[Capture Thread] Connection error: {e}")
+                    if stop_event.wait(RTSP_RETRY_DELAY):
+                        break
+                    continue
+            
+            # Read frame
+            ret, frame = cap.read()
+            
+            if not ret or frame is None:
+                print("[Capture Thread] Failed to read frame, signaling reconnection...")
+                reconnect_event.set()
+                time.sleep(0.1)
+                continue
+            
+            # Put frame in queue (drop old frames if queue is full)
+            try:
+                if frame_queue.full():
+                    # Remove oldest frame to keep only latest
+                    try:
+                        frame_queue.get_nowait()
+                        stats['frames_dropped'] = stats.get('frames_dropped', 0) + 1
+                    except queue.Empty:
+                        pass
+                
+                frame_queue.put_nowait((frame.copy(), time.time()))
+                stats['frames_captured'] = stats.get('frames_captured', 0) + 1
+            except queue.Full:
+                stats['frames_dropped'] = stats.get('frames_dropped', 0) + 1
+            
+        except Exception as e:
+            print(f"[Capture Thread] Error: {e}")
+            reconnect_event.set()
+            time.sleep(0.1)
+    
+    # Cleanup
+    if cap is not None:
+        cap.release()
+    print("[Capture Thread] Stopped")
+
+
+def compare_rtsp_stream(rtsp_url: str, 
+                       threshold: float = DEFAULT_VIDEO_THRESHOLD,
+                       jsonl_path: str = DEFAULT_JSONL_PATH,
+                       load_last_n: int = MAX_EMBEDDINGS_DEFAULT,
+                       src_folder: str = DEFAULT_SRC_FOLDER,
+                       enable_recording: bool = ENABLE_RECORDING_DEFAULT,
+                       output_path: Optional[str] = None,
+                       window_name: str = "Face Recognition RTSP Stream") -> None:
+    """
+    Process RTSP stream in real-time with face detection and recognition.
+    
+    Uses multi-threading to capture frames and process them separately for optimal performance.
+    Features:
+    - Automatic reconnection on stream drops
+    - Frame skipping to maintain real-time performance
+    - Live display with face recognition overlays
+    - Optional video recording
+    - Performance monitoring
+    
+    Args:
+        rtsp_url: RTSP stream URL (e.g., 'rtsp://username:password@ip:port/stream')
+        threshold: Similarity threshold for face recognition (default: 0.44)
+        jsonl_path: Path to JSONL file containing embeddings
+        load_last_n: Number of embeddings to load from JSONL (default: 100000)
+        src_folder: Folder containing reference images for display
+        enable_recording: Whether to record processed frames to video file
+        output_path: Path for output video (required if enable_recording=True)
+        window_name: Name of the display window
+    """
+    print(f"Starting RTSP stream processing: {rtsp_url}")
+    print(f"Threshold: {threshold}, Load last N: {load_last_n}")
+    
+    # Load embeddings DB
+    print("Loading embeddings...")
+    img_paths, person_labels, features_matrix = load_embeddings_from_jsonl(
+        jsonl_path, use_last_n=load_last_n, label_func=get_display_label_from_path
+    )
+    
+    # Build FAISS index
+    index = build_faiss_index(features_matrix, use_ivf=True, nlist=FAISS_NLIST, nprobe=FAISS_NPROBE)
+    print(f'Loaded {len(img_paths)} embeddings')
+    
+    # Initialize frame queue and synchronization primitives
+    frame_queue = queue.Queue(maxsize=FRAME_QUEUE_MAXSIZE)
+    stop_event = threading.Event()
+    reconnect_event = threading.Event()
+    
+    # Statistics tracking
+    stats = {
+        'frames_captured': 0,
+        'frames_dropped': 0,
+        'frames_processed': 0,
+        'reconnect_count': 0,
+        'total_faces': 0,
+        'matched_faces': 0,
+        'rejected_faces': 0
+    }
+    
+    # Start capture thread
+    capture_thread = threading.Thread(
+        target=rtsp_capture_thread,
+        args=(rtsp_url, frame_queue, stop_event, reconnect_event, stats),
+        daemon=True
+    )
+    capture_thread.start()
+    
+    # Wait a bit for initial connection
+    time.sleep(2)
+    
+    # Initialize video writer if recording enabled
+    out = None
+    width, height = None, None
+    fps = 25.0
+    
+    if enable_recording:
+        if output_path is None:
+            timestamp = int(time.time())
+            output_path = f"rtsp_output_{timestamp}.mp4"
+        print(f"Recording enabled. Output: {output_path}")
+    
+    # Processing state
+    ref_cache: Dict[str, np.ndarray] = {}
+    current_refs: List[tuple[np.ndarray, str]] = []
+    frames_since_match = 999
+    MATCH_SCORE_MIN = threshold
+    
+    frame_count = 0
+    start_time = time.time()
+    last_fps_time = start_time
+    fps_counter = 0
+    
+    print("Starting processing loop. Press 'q' to quit.")
+    
+    try:
+        while True:
+            # Check for quit key
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("Quit requested by user.")
+                break
+            
+            # Get frame from queue
+            try:
+                frame, capture_time = frame_queue.get(timeout=0.1)
+            except queue.Empty:
+                # No frame available, check if we need to reconnect
+                if reconnect_event.is_set():
+                    print("[Main Thread] Waiting for reconnection...")
+                    time.sleep(1)
+                continue
+            
+            # Initialize video writer on first frame
+            if enable_recording and out is None:
+                height, width = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                print(f"Video writer initialized: {width}x{height} @ {fps} FPS")
+            
+            frame_count += 1
+            fps_counter += 1
+            
+            # Process frame: Face detection
+            bboxes, kpss = detector.autodetect(frame, max_num=8)
+            
+            if bboxes.shape[0] == 0:
+                # No faces detected, but show persistent refs if any
+                if current_refs and frames_since_match <= PERSIST_FRAMES:
+                    overlay_refs_montage(frame, current_refs)
+                    frames_since_match += 1
+            else:
+                stats['total_faces'] += bboxes.shape[0]
+                
+                # Process each detected face
+                matches = {}
+                for i in range(bboxes.shape[0]):
+                    kps = kpss[i]
+                    box = bboxes[i].astype(int)
+                    feat = rec.get(frame, kps)
+                    
+                    if feat is None:
+                        cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 2)
+                        continue
+                    
+                    # Face recognition: Search in FAISS index
+                    feat = np.array(feat, dtype='float32').reshape(1, -1)
+                    faiss.normalize_L2(feat)
+                    D, I = index.search(feat, 1)
+                    sim = float(D[0][0])
+                    match_index = int(I[0][0])
+                    matched_img = img_paths[match_index]
+                    label = get_display_label_from_path(matched_img)
+                    
+                    # Determine match status
+                    if sim >= MATCH_SCORE_MIN:
+                        prev = matches.get(label)
+                        if prev is None or sim > prev[0]:
+                            matches[label] = (sim, matched_img)
+                        color = (0, 255, 0)
+                        stats['matched_faces'] += 1
+                    else:
+                        color = (0, 0, 255)
+                        stats['rejected_faces'] += 1
+                    
+                    # Draw bounding box and similarity score
+                    cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), color, 2)
+                    cv2.putText(frame, f"sim ({sim:.2f})", (box[0], box[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # Update reference images overlay
+                if matches:
+                    sorted_matches = sorted(matches.items(), key=lambda kv: kv[1][0], reverse=True)
+                    display = []
+                    for idx, (label, (sim_val, path)) in enumerate(sorted_matches[:MAX_OVERLAYS]):
+                        ref_img = get_ref_image(path, src_folder, ref_cache)
+                        if ref_img is not None:
+                            display.append((ref_img, label))
+                    current_refs = display
+                    frames_since_match = 0
+                else:
+                    frames_since_match += 1
+                    if frames_since_match > PERSIST_FRAMES:
+                        current_refs = []
+                
+                # Overlay reference images if needed
+                if current_refs and frames_since_match <= PERSIST_FRAMES:
+                    overlay_refs_montage(frame, current_refs)
+            
+            stats['frames_processed'] += 1
+            
+            # Draw status overlay
+            elapsed = time.time() - start_time
+            current_time = time.time()
+            
+            # Calculate FPS (update every second)
+            if current_time - last_fps_time >= 1.0:
+                current_fps = fps_counter / (current_time - last_fps_time)
+                fps_counter = 0
+                last_fps_time = current_time
+            else:
+                current_fps = frame_count / elapsed if elapsed > 0 else 0.0
+            
+            # Status text overlay
+            status_lines = [
+                f"FPS: {current_fps:.1f}",
+                f"Frames: {frame_count}",
+                f"Faces: {stats['total_faces']}",
+                f"Matched: {stats['matched_faces']}",
+                # f"Dropped: {stats['frames_dropped']}",
+            ]
+            
+            if reconnect_event.is_set():
+                status_lines.append("RECONNECTING...")
+            
+            y_offset = 30
+            for i, line in enumerate(status_lines):
+                cv2.putText(frame, line, (10, y_offset + i * 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Display frame
+            cv2.imshow(window_name, frame)
+            
+            # Write to video file if recording
+            if enable_recording and out is not None:
+                out.write(frame)
+            
+            # Periodic status updates
+            if frame_count % 100 == 0:
+                elapsed = time.time() - start_time
+                avg_fps = frame_count / elapsed if elapsed > 0 else 0.0
+                print(f"[{frame_count} frames] FPS: {avg_fps:.2f}, "
+                      f"Faces: {stats['total_faces']}, "
+                      f"Matched: {stats['matched_faces']}, "
+                      f"Dropped: {stats['frames_dropped']}")
+    
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    except Exception as e:
+        print(f"\nError during processing: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        print("\nShutting down...")
+        stop_event.set()
+        
+        # Wait for capture thread to finish (with timeout)
+        capture_thread.join(timeout=5.0)
+        
+        if out is not None:
+            out.release()
+        
+        cv2.destroyAllWindows()
+        
+        # Final statistics
+        total_time = time.time() - start_time
+        avg_fps = frame_count / total_time if total_time > 0 else 0.0
+        
+        print(f"\n==== Final Statistics ====")
+        print(f"Total frames processed: {frame_count}")
+        print(f"Total faces detected: {stats['total_faces']}")
+        print(f"Matched faces: {stats['matched_faces']}")
+        print(f"Rejected faces: {stats['rejected_faces']}")
+        print(f"Frames captured: {stats['frames_captured']}")
+        print(f"Frames dropped: {stats['frames_dropped']}")
+        print(f"Reconnections: {stats['reconnect_count']}")
+        print(f"Average FPS: {avg_fps:.2f}")
+        if enable_recording and output_path:
+            print(f"Output video saved to: {output_path}")
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
 if __name__ == '__main__':
     st = time.time()
     # compare_video('videos/input/classroom.gif', threshold=0.45)
-    go_through("/home/sr/ov_fr_pipeline/videos/input/Train", "final_embeddings_adaface_ov_trial.jsonl")
+    # go_through("/home/sr/ov_fr_pipeline/videos/input/Train", "final_embeddings_adaface_ov_trial.jsonl")
     # compare_video_last_detailed('/home/sr/ov_fr/videos/input/15724-865412877_medium.mp4', threshold=0.49, output_path='videos/output/ov/Train_50_Blur_fp16_fp16.mp4')
     # compare_video_live_display('videos/input/39837-424360872_small.mp4', threshold=0.45, output_path='videos/output/output_video_walking_with_match_live_1920-1080_45.mp4')
+    
+    # RTSP Stream Processing Example:
+    compare_rtsp_stream(
+        rtsp_url='rtsp://192.168.10.94/live1.sdp',
+        threshold=0.49,
+        jsonl_path='final_embeddings_adaface_ov_fp16.jsonl',
+        load_last_n=100000,
+        enable_recording=False,  # Set to True to record
+        output_path='rtsp_output.mp4'  # Required if enable_recording=True
+    )
+    
     print(f"Time taken: {time.time() - st} seconds")
