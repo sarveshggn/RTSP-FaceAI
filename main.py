@@ -8,6 +8,7 @@ import time
 import shutil
 import tempfile
 import faiss
+import sqlite3
 from collections import deque
 from typing import Set, List, Dict
 
@@ -47,6 +48,8 @@ MAX_EMBEDDINGS_DEFAULT = 100000
 DEFAULT_SRC_FOLDER = "/home/sr/edge_face"
 DEFAULT_PHOTOS_FOLDER = "/home/sr/Photos"
 DEFAULT_JSONL_PATH = 'final_embeddings_adaface_ov_fp16.jsonl'
+DEFAULT_DB_PATH = 'embeddings.db'
+DEFAULT_EMBEDDINGS_DIR = 'embeddings_storage'
 
 # ============================================================================
 # Model Initialization
@@ -186,14 +189,43 @@ def load_jsonl_paths_and_bases(jsonl_path: str) -> (List[str], Set[str]):
 # JSONL Processing Functions
 # ============================================================================
 
-def go_through(src_folder: str = "/home/sr/ov_fr/videos/input/Train",
-               jsonl_out: str = DEFAULT_JSONL_PATH) -> int:
+def init_embeddings_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    """
+    Initialize SQLite database for storing embeddings metadata.
+    Creates table if it doesn't exist.
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id TEXT NOT NULL,
+            embeddings_path TEXT NOT NULL UNIQUE,
+            image_path TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_person_id ON embeddings(person_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_embeddings_path ON embeddings(embeddings_path)')
+    conn.commit()
+    conn.close()
+
+
+def go_through(src_folder: str = "/home/sr/ov_fr_pipeline/videos/input/Train",
+               jsonl_out: str = DEFAULT_JSONL_PATH,
+               db_path: str = DEFAULT_DB_PATH,
+               embeddings_dir: str = DEFAULT_EMBEDDINGS_DIR) -> int:
     """
     Scans src_folder (top-level only) for images (including names with _01/_02 suffixes).
     For any base_id for which new variant images are found, removes old JSONL entries
     with that base_id and replaces them with the new entries.
+    Also maintains a SQLite database with person_id and embeddings_path.
     Returns number of new embeddings written.
     """
+    # Initialize database and embeddings directory
+    init_embeddings_db(db_path)
+    os.makedirs(embeddings_dir, exist_ok=True)
+    
     # 1) Gather images in folder (non-recursive)
     if not osp.isdir(src_folder):
         raise ValueError(f"src_folder does not exist: {src_folder}")
@@ -216,6 +248,28 @@ def go_through(src_folder: str = "/home/sr/ov_fr/videos/input/Train",
     #    Only consider base_ids for which we have at least one new file in src_folder
     candidate_bases = set(imgs_by_base.keys())
     bases_to_replace = candidate_bases.intersection(existing_bases)
+
+    # 3b) Handle database cleanup for bases_to_replace
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    if bases_to_replace:
+        # Get embeddings paths for old entries that will be deleted
+        placeholders = ','.join(['?'] * len(bases_to_replace))
+        cursor.execute(f'SELECT embeddings_path FROM embeddings WHERE person_id IN ({placeholders})',
+                      list(bases_to_replace))
+        old_emb_paths = [row[0] for row in cursor.fetchall()]
+        
+        # Delete old database entries
+        cursor.execute(f'DELETE FROM embeddings WHERE person_id IN ({placeholders})',
+                      list(bases_to_replace))
+        
+        # Delete corresponding .npy files
+        for old_emb_path in old_emb_paths:
+            if osp.exists(old_emb_path):
+                try:
+                    os.remove(old_emb_path)
+                except OSError:
+                    pass
 
     # 4) Prepare to rewrite JSONL: filter out lines whose path's base_id is in bases_to_replace
     #    We'll write a new temp file that contains filtered old lines, then append new items.
@@ -276,14 +330,37 @@ def go_through(src_folder: str = "/home/sr/ov_fr/videos/input/Train",
                         continue
 
                     feat_arr = np.array(feat, dtype=np.float32).reshape(-1)
+                    
+                    # Write to JSONL (existing functionality)
                     record = {'path': img_path, 'feat': feat_arr.tolist()}
                     tmp_f.write(json.dumps(record) + '\n')
                     tmp_f.flush()
+                    
+                    # Also save to database and as .npy file
+                    person_id = base  # person_id is the base_id
+                    embedding_filename = f"{person_id}_{fn}_{int(time.time())}.npy"
+                    embedding_path = osp.join(embeddings_dir, embedding_filename)
+                    np.save(embedding_path, feat_arr)
+                    
+                    # Insert into database
+                    try:
+                        cursor.execute('''
+                            INSERT INTO embeddings (person_id, embeddings_path, image_path)
+                            VALUES (?, ?, ?)
+                        ''', (person_id, embedding_path, img_path))
+                    except sqlite3.IntegrityError:
+                        # If embeddings_path already exists, skip or update
+                        print(f"Warning: Embedding path already exists: {embedding_path}")
+                    
                     added += 1
+
+        # Commit database changes
+        conn.commit()
 
         # Replace original jsonl with temp (atomic move)
         shutil.move(tmp_path, jsonl_out)
         print(f"Rewrote {jsonl_out}: removed {len(bases_to_replace)} base(s) and added {added} new embeddings.")
+        print(f"Updated database {db_path}: removed {len(bases_to_replace)} person_id(s) and added {added} new embeddings.")
         return added
 
     finally:
@@ -293,6 +370,11 @@ def go_through(src_folder: str = "/home/sr/ov_fr/videos/input/Train",
                 os.remove(tmp_path)
             except OSError:
                 pass
+        # Ensure database connection is closed
+        try:
+            conn.close()
+        except:
+            pass
 
 
 # ============================================================================
@@ -948,7 +1030,7 @@ def compare_video_live_display(video_path: str, threshold: float = DEFAULT_VIDEO
 if __name__ == '__main__':
     st = time.time()
     # compare_video('videos/input/classroom.gif', threshold=0.45)
-    # go_through()
-    compare_video_last_detailed('/home/sr/ov_fr/videos/input/15724-865412877_medium.mp4', threshold=0.49, output_path='videos/output/ov/Train_50_Blur_fp16_fp16.mp4')
+    go_through("/home/sr/ov_fr_pipeline/videos/input/Train", "final_embeddings_adaface_ov_trial.jsonl")
+    # compare_video_last_detailed('/home/sr/ov_fr/videos/input/15724-865412877_medium.mp4', threshold=0.49, output_path='videos/output/ov/Train_50_Blur_fp16_fp16.mp4')
     # compare_video_live_display('videos/input/39837-424360872_small.mp4', threshold=0.45, output_path='videos/output/output_video_walking_with_match_live_1920-1080_45.mp4')
     print(f"Time taken: {time.time() - st} seconds")

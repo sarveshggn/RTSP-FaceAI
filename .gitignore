@@ -51,6 +51,7 @@ MANIFEST
 /buffalo_l
 /fr_env
 /videos
+/embeddings_storage
 /.venv
 
 # Database
